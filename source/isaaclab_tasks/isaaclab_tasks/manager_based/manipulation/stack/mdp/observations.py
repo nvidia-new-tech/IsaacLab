@@ -315,24 +315,38 @@ def object_grasped(
     else:
         if hasattr(env.cfg, "gripper_joint_names"):
             gripper_joint_ids, _ = robot.find_joints(env.cfg.gripper_joint_names)
-            assert len(gripper_joint_ids) == 2, "Observations only support parallel gripper for now"
-
-            grasped = torch.logical_and(
-                pose_diff < diff_threshold,
-                torch.abs(
-                    robot.data.joint_pos[:, gripper_joint_ids[0]]
-                    - torch.tensor(env.cfg.gripper_open_val, dtype=torch.float32).to(env.device)
+            
+            # Support both single-joint and parallel grippers
+            if len(gripper_joint_ids) == 1:
+                # Single-joint gripper (e.g., SO-ARM101)
+                grasped = torch.logical_and(
+                    pose_diff < diff_threshold,
+                    torch.abs(
+                        robot.data.joint_pos[:, gripper_joint_ids[0]]
+                        - torch.tensor(env.cfg.gripper_open_val, dtype=torch.float32).to(env.device)
+                    )
+                    > env.cfg.gripper_threshold,
                 )
-                > env.cfg.gripper_threshold,
-            )
-            grasped = torch.logical_and(
-                grasped,
-                torch.abs(
-                    robot.data.joint_pos[:, gripper_joint_ids[1]]
-                    - torch.tensor(env.cfg.gripper_open_val, dtype=torch.float32).to(env.device)
+            elif len(gripper_joint_ids) == 2:
+                # Parallel gripper with two joints (e.g., Franka Panda)
+                grasped = torch.logical_and(
+                    pose_diff < diff_threshold,
+                    torch.abs(
+                        robot.data.joint_pos[:, gripper_joint_ids[0]]
+                        - torch.tensor(env.cfg.gripper_open_val, dtype=torch.float32).to(env.device)
+                    )
+                    > env.cfg.gripper_threshold,
                 )
-                > env.cfg.gripper_threshold,
-            )
+                grasped = torch.logical_and(
+                    grasped,
+                    torch.abs(
+                        robot.data.joint_pos[:, gripper_joint_ids[1]]
+                        - torch.tensor(env.cfg.gripper_open_val, dtype=torch.float32).to(env.device)
+                    )
+                    > env.cfg.gripper_threshold,
+                )
+            else:
+                raise AssertionError(f"Gripper with {len(gripper_joint_ids)} joints is not supported. Only 1 or 2 joints are supported.")
 
     return grasped
 
@@ -367,25 +381,41 @@ def object_stacked(
     else:
         if hasattr(env.cfg, "gripper_joint_names"):
             gripper_joint_ids, _ = robot.find_joints(env.cfg.gripper_joint_names)
-            assert len(gripper_joint_ids) == 2, "Observations only support parallel gripper for now"
-            stacked = torch.logical_and(
-                torch.isclose(
-                    robot.data.joint_pos[:, gripper_joint_ids[0]],
-                    torch.tensor(env.cfg.gripper_open_val, dtype=torch.float32).to(env.device),
-                    atol=1e-4,
-                    rtol=1e-4,
-                ),
-                stacked,
-            )
-            stacked = torch.logical_and(
-                torch.isclose(
-                    robot.data.joint_pos[:, gripper_joint_ids[1]],
-                    torch.tensor(env.cfg.gripper_open_val, dtype=torch.float32).to(env.device),
-                    atol=1e-4,
-                    rtol=1e-4,
-                ),
-                stacked,
-            )
+            
+            # Support both single-joint and parallel grippers
+            if len(gripper_joint_ids) == 1:
+                # Single-joint gripper (e.g., SO-ARM101)
+                stacked = torch.logical_and(
+                    torch.isclose(
+                        robot.data.joint_pos[:, gripper_joint_ids[0]],
+                        torch.tensor(env.cfg.gripper_open_val, dtype=torch.float32).to(env.device),
+                        atol=1e-4,
+                        rtol=1e-4,
+                    ),
+                    stacked,
+                )
+            elif len(gripper_joint_ids) == 2:
+                # Parallel gripper with two joints (e.g., Franka Panda)
+                stacked = torch.logical_and(
+                    torch.isclose(
+                        robot.data.joint_pos[:, gripper_joint_ids[0]],
+                        torch.tensor(env.cfg.gripper_open_val, dtype=torch.float32).to(env.device),
+                        atol=1e-4,
+                        rtol=1e-4,
+                    ),
+                    stacked,
+                )
+                stacked = torch.logical_and(
+                    torch.isclose(
+                        robot.data.joint_pos[:, gripper_joint_ids[1]],
+                        torch.tensor(env.cfg.gripper_open_val, dtype=torch.float32).to(env.device),
+                        atol=1e-4,
+                        rtol=1e-4,
+                    ),
+                    stacked,
+                )
+            else:
+                raise AssertionError(f"Gripper with {len(gripper_joint_ids)} joints is not supported. Only 1 or 2 joints are supported.")
         else:
             raise ValueError("No gripper_joint_names found in environment config")
 

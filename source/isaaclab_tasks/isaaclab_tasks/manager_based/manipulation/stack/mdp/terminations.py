@@ -67,27 +67,42 @@ def cubes_stacked(
     else:
         if hasattr(env.cfg, "gripper_joint_names"):
             gripper_joint_ids, _ = robot.find_joints(env.cfg.gripper_joint_names)
-            assert len(gripper_joint_ids) == 2, "Terminations only support parallel gripper for now"
+            
+            # Support both single-joint and parallel grippers
+            if len(gripper_joint_ids) == 1:
+                # Single-joint gripper (e.g., SO-ARM101)
+                stacked = torch.logical_and(
+                    torch.isclose(
+                        robot.data.joint_pos[:, gripper_joint_ids[0]],
+                        torch.tensor(env.cfg.gripper_open_val, dtype=torch.float32).to(env.device),
+                        atol=atol,
+                        rtol=rtol,
+                    ),
+                    stacked,
+                )
+            elif len(gripper_joint_ids) == 2:
+                # Parallel gripper with two joints (e.g., Franka Panda)
+                stacked = torch.logical_and(
+                    torch.isclose(
+                        robot.data.joint_pos[:, gripper_joint_ids[0]],
+                        torch.tensor(env.cfg.gripper_open_val, dtype=torch.float32).to(env.device),
+                        atol=atol,
+                        rtol=rtol,
+                    ),
+                    stacked,
+                )
+                stacked = torch.logical_and(
+                    torch.isclose(
+                        robot.data.joint_pos[:, gripper_joint_ids[1]],
+                        torch.tensor(env.cfg.gripper_open_val, dtype=torch.float32).to(env.device),
+                        atol=atol,
+                        rtol=rtol,
+                    ),
+                    stacked,
+                )
+            else:
+                raise AssertionError(f"Gripper with {len(gripper_joint_ids)} joints is not supported. Only 1 or 2 joints are supported.")
 
-            stacked = torch.logical_and(
-                torch.isclose(
-                    robot.data.joint_pos[:, gripper_joint_ids[0]],
-                    torch.tensor(env.cfg.gripper_open_val, dtype=torch.float32).to(env.device),
-                    atol=atol,
-                    rtol=rtol,
-                ),
-                stacked,
-            )
-            stacked = torch.logical_and(
-                torch.isclose(
-                    robot.data.joint_pos[:, gripper_joint_ids[1]],
-                    torch.tensor(env.cfg.gripper_open_val, dtype=torch.float32).to(env.device),
-                    atol=atol,
-                    rtol=rtol,
-                ),
-                stacked,
-            )
-        else:
-            raise ValueError("No gripper_joint_names found in environment config")
+    return stacked
 
     return stacked
