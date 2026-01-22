@@ -30,3 +30,6 @@ from .shadow_hand import *
 from .spot import *
 from .unitree import *
 from .universal_robots import *
+
+##Victor add new robot imports above this line
+from .soarm101 import *
