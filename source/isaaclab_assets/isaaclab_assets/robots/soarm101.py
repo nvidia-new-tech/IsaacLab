@@ -18,8 +18,6 @@ import isaaclab.sim as sim_utils
 from isaaclab.actuators import ImplicitActuatorCfg
 from isaaclab.assets.articulation import ArticulationCfg
 
-from isaaclab_assets import TEMPLATE_ASSETS_DATA_DIR
-
 # Point to the data directory in the same robots folder
 ROBOTS_DATA_DIR = Path(__file__).resolve().parent / "data"
 
