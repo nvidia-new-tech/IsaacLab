@@ -65,21 +65,21 @@ SO_ARM101_CFG = ArticulationCfg(
         # Jaw               moves: Only moving jaw              (~0.034kg)
         "arm": ImplicitActuatorCfg(
             joint_names_expr=["shoulder_.*", "elbow_flex", "wrist_.*"],
-            effort_limit_sim=1.9,
-            velocity_limit_sim=1.5,
+            effort_limit_sim=5.0,#base line 1.9
+            velocity_limit_sim=4.0,#base line 1.5
             stiffness={
-                "shoulder_pan": 200.0,  # Highest - moves all mass
-                "shoulder_lift": 170.0,  # Slightly less than rotation
-                "elbow_flex": 120.0,  # Reduced based on less mass
-                "wrist_flex": 80.0,  # Reduced for less mass
-                "wrist_roll": 50.0,  # Low mass to move
+                "shoulder_pan": 400.0, #base line 200  # Highest - moves all mass
+                "shoulder_lift": 600.0,#base line 170  # Slightly less than rotation
+                "elbow_flex": 400.0, #base line 120 # Reduced based on less mass
+                "wrist_flex": 200.0, #base line 80 # Reduced for less mass
+                "wrist_roll": 100.0, #base line 50 # Low mass to move
             },
             damping={
-                "shoulder_pan": 80.0,
-                "shoulder_lift": 65.0,
-                "elbow_flex": 45.0,
-                "wrist_flex": 30.0,
-                "wrist_roll": 20.0,
+                "shoulder_pan": 10.0, #base line 80
+                "shoulder_lift": 15.0, #base line 65
+                "elbow_flex": 10.0, #base line 45
+                "wrist_flex": 5.0, #base line 30
+                "wrist_roll": 2.0, #base line 20
             },
         ),
         "gripper": ImplicitActuatorCfg(
