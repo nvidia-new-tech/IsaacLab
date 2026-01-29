@@ -25,3 +25,13 @@ gym.register(
     },
     disable_env_checker=True,
 )
+
+gym.register(
+    id="Isaac-Stack-Cube-SOARM101-lerobot-v0",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.stack_lerobot_env_cfg:Soarm101CubeStackLeRobotEnvCfg",
+        #"robomimic_bc_cfg_entry_point": f"{agents.__name__}:robomimic/bc_rnn_low_dim.json",
+    },
+    disable_env_checker=True,
+)

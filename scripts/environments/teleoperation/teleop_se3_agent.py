@@ -26,8 +26,40 @@ parser.add_argument(
     help=(
         "Teleop device. Set here (legacy) or via the environment config. If using the environment config, pass the"
         " device key/name defined under 'teleop_devices' (it can be a custom name, not necessarily 'handtracking')."
-        " Built-ins: keyboard, spacemouse, gamepad. Not all tasks support all built-ins."
+        " Built-ins: keyboard, spacemouse, gamepad, lerobot. Not all tasks support all built-ins."
     ),
+)
+parser.add_argument("--port", type=str, default=None, help="Serial port for LeRobot (e.g. /dev/ttyACM0).")
+parser.add_argument(
+    "--lerobot_calibrate",
+    action="store_true",
+    default=True,
+    help="Run LeRobot calibration if no calibration is found.",
+)
+parser.add_argument(
+    "--lerobot_calibrate_at_start",
+    action="store_true",
+    default=True,
+    help="Calibrate initial pose offset between leader and sim on start.",
+)
+parser.add_argument(
+    "--lerobot_arm_gain",
+    type=float,
+    default=1.0,
+    help="Scale factor for leader arm joint deltas before applying to the sim.",
+)
+parser.add_argument(
+    "--lerobot_gripper_gain",
+    type=float,
+    default=1.0,
+    help="Scale factor for leader gripper delta before applying to the sim.",
+)
+parser.add_argument("--lerobot_id", type=str, default=None, help="Optional LeRobot calibration id.")
+parser.add_argument(
+    "--lerobot_calibration_dir",
+    type=str,
+    default=None,
+    help="Directory to store LeRobot calibration files.",
 )
 parser.add_argument("--task", type=str, default=None, help="Name of the task.")
 parser.add_argument("--sensitivity", type=float, default=1.0, help="Sensitivity factor.")
@@ -64,7 +96,15 @@ import logging
 import gymnasium as gym
 import torch
 
-from isaaclab.devices import Se3Gamepad, Se3GamepadCfg, Se3Keyboard, Se3KeyboardCfg, Se3SpaceMouse, Se3SpaceMouseCfg
+from isaaclab.devices import (
+    LeRobotDevice,
+    Se3Gamepad,
+    Se3GamepadCfg,
+    Se3Keyboard,
+    Se3KeyboardCfg,
+    Se3SpaceMouse,
+    Se3SpaceMouseCfg,
+)
 from isaaclab.devices.openxr import remove_camera_configs
 from isaaclab.devices.teleop_device_factory import create_teleop_device
 from isaaclab.envs import ManagerBasedRLEnvCfg
@@ -188,6 +228,11 @@ def main() -> None:
 
     # Create teleop device from config if present, otherwise create manually
     teleop_interface = None
+    lerobot_joint_ids = None
+    lerobot_joint_limits = None
+    lerobot_leader_zero = None
+    lerobot_sim_zero = None
+    lerobot_calibrate_pending = args_cli.lerobot_calibrate_at_start
     try:
         if hasattr(env_cfg, "teleop_devices") and args_cli.teleop_device in env_cfg.teleop_devices.devices:
             teleop_interface = create_teleop_device(
@@ -210,6 +255,18 @@ def main() -> None:
             elif args_cli.teleop_device.lower() == "gamepad":
                 teleop_interface = Se3Gamepad(
                     Se3GamepadCfg(pos_sensitivity=0.1 * sensitivity, rot_sensitivity=0.1 * sensitivity)
+                )
+            elif args_cli.teleop_device.lower() == "lerobot":
+                if not args_cli.port:
+                    logger.error("LeRobot teleop requires --port to be specified (e.g. /dev/ttyACM0)")
+                    env.close()
+                    simulation_app.close()
+                    return
+                teleop_interface = LeRobotDevice(
+                    port=args_cli.port,
+                    calibrate=args_cli.lerobot_calibrate,
+                    robot_id=args_cli.lerobot_id,
+                    calibration_dir=args_cli.lerobot_calibration_dir,
                 )
             else:
                 logger.error(f"Unsupported teleop device: {args_cli.teleop_device}")
@@ -251,6 +308,54 @@ def main() -> None:
             with torch.inference_mode():
                 # get device command
                 action = teleop_interface.advance()
+
+                if args_cli.teleop_device.lower() == "lerobot":
+                    if isinstance(action, dict):
+                        # Map LeRobot normalized joint values to sim joint limits.
+                        if lerobot_joint_ids is None:
+                            robot = env.scene["robot"]
+                            joint_names = [
+                                "shoulder_pan",
+                                "shoulder_lift",
+                                "elbow_flex",
+                                "wrist_flex",
+                                "wrist_roll",
+                                "gripper",
+                            ]
+                            lerobot_joint_ids, _ = robot.find_joints(joint_names)
+                            lerobot_joint_limits = robot.data.soft_joint_pos_limits[0, lerobot_joint_ids].clone()
+
+                        arm_vals = torch.tensor(list(action["joint_pos"]), dtype=torch.float32, device=env.device)
+                        grip_val = torch.tensor([action["gripper"]], dtype=torch.float32, device=env.device)
+                        raw_vals = torch.cat([arm_vals, grip_val], dim=0)
+
+                        # If values already look like radians (within limits), pass through.
+                        mins = lerobot_joint_limits[:, 0]
+                        maxs = lerobot_joint_limits[:, 1]
+                        in_range = torch.logical_and(raw_vals >= (mins - 0.1), raw_vals <= (maxs + 0.1)).all()
+                        if not in_range:
+                            # Map arm from [-100, 100] and gripper from [0, 100] into joint limits.
+                            arm_norm = raw_vals[:-1].clamp(-100.0, 100.0)
+                            grip_norm = raw_vals[-1].clamp(0.0, 100.0)
+                            arm_scaled = mins[:-1] + (arm_norm + 100.0) * (maxs[:-1] - mins[:-1]) / 200.0
+                            grip_scaled = mins[-1] + (grip_norm) * (maxs[-1] - mins[-1]) / 100.0
+                            raw_vals = torch.cat([arm_scaled, grip_scaled.unsqueeze(0)], dim=0)
+
+                        if lerobot_calibrate_pending or lerobot_leader_zero is None or lerobot_sim_zero is None:
+                            lerobot_leader_zero = raw_vals.clone()
+                            robot = env.scene["robot"]
+                            lerobot_sim_zero = robot.data.joint_pos[0, lerobot_joint_ids].clone()
+                            lerobot_calibrate_pending = False
+
+                        gains = torch.tensor(
+                            [args_cli.lerobot_arm_gain] * 5 + [args_cli.lerobot_gripper_gain],
+                            dtype=torch.float32,
+                            device=env.device,
+                        )
+                        action = lerobot_sim_zero + (raw_vals - lerobot_leader_zero) * gains
+                        action = action.clamp(mins, maxs)
+                    elif not torch.is_tensor(action):
+                        action = torch.tensor(action, dtype=torch.float32, device=env.device)
 
                 # Only apply teleop commands when active
                 if teleoperation_active:
