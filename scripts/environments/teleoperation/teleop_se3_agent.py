@@ -12,6 +12,7 @@ controllers)."""
 """Launch Isaac Sim Simulator first."""
 
 import argparse
+import math
 from collections.abc import Callable
 
 from isaaclab.app import AppLauncher
@@ -53,6 +54,72 @@ parser.add_argument(
     type=float,
     default=1.0,
     help="Scale factor for leader gripper delta before applying to the sim.",
+)
+parser.add_argument(
+    "--lerobot_shoulder_pan_center_raw",
+    type=float,
+    default=0.0,
+    help="Leader shoulder_pan raw value at physical center (normalized).",
+)
+parser.add_argument(
+    "--lerobot_shoulder_pan_left_raw",
+    type=float,
+    default=-100.0,
+    help="Leader shoulder_pan raw value at left limit (normalized).",
+)
+parser.add_argument(
+    "--lerobot_shoulder_pan_right_raw",
+    type=float,
+    default=100.0,
+    help="Leader shoulder_pan raw value at right limit (normalized).",
+)
+parser.add_argument(
+    "--lerobot_shoulder_pan_left_deg",
+    type=float,
+    default=-90.0,
+    help="Virtual shoulder_pan degrees to map at left raw limit.",
+)
+parser.add_argument(
+    "--lerobot_shoulder_pan_right_deg",
+    type=float,
+    default=90.0,
+    help="Virtual shoulder_pan degrees to map at right raw limit.",
+)
+parser.add_argument(
+    "--lerobot_mapping_calibrate",
+    action="store_true",
+    default=False,
+    help="Print raw lerobot joint values for calibration.",
+)
+parser.add_argument(
+    "--lerobot_joint_center_raw",
+    type=str,
+    default="5.66,0.67,3.21,3.21,-0.76,33.33",
+    help="Comma-separated center raw values for joints: shoulder_pan, shoulder_lift, elbow_flex, wrist_flex, wrist_roll, gripper.",
+)
+parser.add_argument(
+    "--lerobot_joint_left_raw",
+    type=str,
+    default="-100.00,-99.75,-99.55,-98.54,92.82,0.00",
+    help="Comma-separated left/raw-min values for joints (same order as center).",
+)
+parser.add_argument(
+    "--lerobot_joint_right_raw",
+    type=str,
+    default="100.00,99.92,99.19,73.68,-92.38,100.00",
+    help="Comma-separated right/raw-max values for joints (same order as center).",
+)
+parser.add_argument(
+    "--lerobot_joint_left_deg",
+    type=str,
+    default="-110,-100,-100,-95,-160,-10",
+    help="Comma-separated target degrees at left/raw-min for joints (same order as center).",
+)
+parser.add_argument(
+    "--lerobot_joint_right_deg",
+    type=str,
+    default="110,100,90,95,160,100",
+    help="Comma-separated target degrees at right/raw-max for joints (same order as center).",
 )
 parser.add_argument("--lerobot_id", type=str, default=None, help="Optional LeRobot calibration id.")
 parser.add_argument(
@@ -120,6 +187,14 @@ if args_cli.enable_pinocchio:
 
 # import logger
 logger = logging.getLogger(__name__)
+
+def _parse_csv_floats(value: str | None, expected: int, name: str) -> list[float] | None:
+    if value is None:
+        return None
+    parts = [p.strip() for p in value.split(",") if p.strip()]
+    if len(parts) != expected:
+        raise ValueError(f"{name} expects {expected} comma-separated values, got {len(parts)}: {value}")
+    return [float(p) for p in parts]
 
 
 def main() -> None:
@@ -233,6 +308,19 @@ def main() -> None:
     lerobot_leader_zero = None
     lerobot_sim_zero = None
     lerobot_calibrate_pending = args_cli.lerobot_calibrate_at_start
+    lerobot_joint_names = [
+        "shoulder_pan",
+        "shoulder_lift",
+        "elbow_flex",
+        "wrist_flex",
+        "wrist_roll",
+        "gripper",
+    ]
+    joint_center_raw = _parse_csv_floats(args_cli.lerobot_joint_center_raw, 6, "--lerobot_joint_center_raw")
+    joint_left_raw = _parse_csv_floats(args_cli.lerobot_joint_left_raw, 6, "--lerobot_joint_left_raw")
+    joint_right_raw = _parse_csv_floats(args_cli.lerobot_joint_right_raw, 6, "--lerobot_joint_right_raw")
+    joint_left_deg = _parse_csv_floats(args_cli.lerobot_joint_left_deg, 6, "--lerobot_joint_left_deg")
+    joint_right_deg = _parse_csv_floats(args_cli.lerobot_joint_right_deg, 6, "--lerobot_joint_right_deg")
     try:
         if hasattr(env_cfg, "teleop_devices") and args_cli.teleop_device in env_cfg.teleop_devices.devices:
             teleop_interface = create_teleop_device(
@@ -308,6 +396,11 @@ def main() -> None:
             with torch.inference_mode():
                 # get device command
                 action = teleop_interface.advance()
+                if args_cli.teleop_device.lower() == "lerobot" and isinstance(action, dict):
+                    if args_cli.lerobot_mapping_calibrate:
+                        raw_list = list(action["joint_pos"]) + [action["gripper"]]
+                        raw_msg = ", ".join(f"{name}={val:7.2f}" for name, val in zip(lerobot_joint_names, raw_list))
+                        print(f"[LEROBOT RAW] {raw_msg}")
 
                 if args_cli.teleop_device.lower() == "lerobot":
                     if isinstance(action, dict):
@@ -328,6 +421,7 @@ def main() -> None:
                         arm_vals = torch.tensor(list(action["joint_pos"]), dtype=torch.float32, device=env.device)
                         grip_val = torch.tensor([action["gripper"]], dtype=torch.float32, device=env.device)
                         raw_vals = torch.cat([arm_vals, grip_val], dim=0)
+                        raw_norm_vals = raw_vals.clone()
 
                         # If values already look like radians (within limits), pass through.
                         mins = lerobot_joint_limits[:, 0]
@@ -353,6 +447,59 @@ def main() -> None:
                             device=env.device,
                         )
                         action = lerobot_sim_zero + (raw_vals - lerobot_leader_zero) * gains
+
+                        # Per-joint asymmetric mapping using measured raw limits (optional).
+                        if all(
+                            v is not None
+                            for v in (joint_center_raw, joint_left_raw, joint_right_raw, joint_left_deg, joint_right_deg)
+                        ):
+                            pan_deg = None
+                            for idx in range(6):
+                                raw_val = raw_norm_vals[idx]
+                                left_raw = joint_left_raw[idx]
+                                right_raw = joint_right_raw[idx]
+                                center_raw = joint_center_raw[idx]
+                                if raw_val <= left_raw:
+                                    deg = joint_left_deg[idx]
+                                elif raw_val >= right_raw:
+                                    deg = joint_right_deg[idx]
+                                elif raw_val < center_raw:
+                                    span = center_raw - left_raw
+                                    deg = 0.0 if span <= 0 else (raw_val - center_raw) * (abs(joint_left_deg[idx]) / span)
+                                else:
+                                    span = right_raw - center_raw
+                                    deg = 0.0 if span <= 0 else (raw_val - center_raw) * (abs(joint_right_deg[idx]) / span)
+                                action[idx] = lerobot_sim_zero[idx] + math.radians(deg)
+                                if idx == 0:
+                                    pan_deg = deg
+                        else:
+                            # Shoulder pan: asymmetric mapping using measured raw limits.
+                            raw_pan = raw_norm_vals[0]
+                            left_raw = args_cli.lerobot_shoulder_pan_left_raw
+                            right_raw = args_cli.lerobot_shoulder_pan_right_raw
+                            center_raw = args_cli.lerobot_shoulder_pan_center_raw
+                            if raw_pan <= left_raw:
+                                pan_deg = args_cli.lerobot_shoulder_pan_left_deg
+                            elif raw_pan >= right_raw:
+                                pan_deg = args_cli.lerobot_shoulder_pan_right_deg
+                            elif raw_pan < center_raw:
+                                span = center_raw - left_raw
+                                pan_deg = (
+                                    0.0
+                                    if span <= 0
+                                    else (raw_pan - center_raw)
+                                    * (abs(args_cli.lerobot_shoulder_pan_left_deg) / span)
+                                )
+                            else:
+                                span = right_raw - center_raw
+                                pan_deg = (
+                                    0.0
+                                    if span <= 0
+                                    else (raw_pan - center_raw)
+                                    * (abs(args_cli.lerobot_shoulder_pan_right_deg) / span)
+                            )
+                            action[0] = lerobot_sim_zero[0] + math.radians(pan_deg)
+
                         action = action.clamp(mins, maxs)
                     elif not torch.is_tensor(action):
                         action = torch.tensor(action, dtype=torch.float32, device=env.device)
