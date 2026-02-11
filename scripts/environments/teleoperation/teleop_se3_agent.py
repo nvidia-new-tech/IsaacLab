@@ -92,9 +92,15 @@ parser.add_argument(
     help="Print raw lerobot joint values for calibration.",
 )
 parser.add_argument(
+    "--lerobot_mapping_debug",
+    action="store_true",
+    default=False,
+    help="Print lerobot raw-to-action mapping per joint.",
+)
+parser.add_argument(
     "--lerobot_joint_center_raw",
     type=str,
-    default="5.66,0.67,3.21,3.21,-0.76,33.33",
+    default="5.66,0.67,3.21,1.03,1.04,7.11",
     help="Comma-separated center raw values for joints: shoulder_pan, shoulder_lift, elbow_flex, wrist_flex, wrist_roll, gripper.",
 )
 parser.add_argument(
@@ -195,6 +201,28 @@ def _parse_csv_floats(value: str | None, expected: int, name: str) -> list[float
     if len(parts) != expected:
         raise ValueError(f"{name} expects {expected} comma-separated values, got {len(parts)}: {value}")
     return [float(p) for p in parts]
+
+
+def _map_raw_to_deg(raw: float, left_raw: float, center_raw: float, right_raw: float, left_deg: float, right_deg: float) -> float:
+    if left_raw < right_raw:
+        if raw <= left_raw:
+            return left_deg
+        if raw >= right_raw:
+            return right_deg
+        if raw < center_raw:
+            span = left_raw - center_raw
+            return 0.0 if span == 0 else (raw - center_raw) / span * left_deg
+        span = right_raw - center_raw
+        return 0.0 if span == 0 else (raw - center_raw) / span * right_deg
+    if raw >= left_raw:
+        return left_deg
+    if raw <= right_raw:
+        return right_deg
+    if raw > center_raw:
+        span = left_raw - center_raw
+        return 0.0 if span == 0 else (raw - center_raw) / span * left_deg
+    span = right_raw - center_raw
+    return 0.0 if span == 0 else (raw - center_raw) / span * right_deg
 
 
 def main() -> None:
@@ -454,24 +482,30 @@ def main() -> None:
                             for v in (joint_center_raw, joint_left_raw, joint_right_raw, joint_left_deg, joint_right_deg)
                         ):
                             pan_deg = None
+                            debug_degs = [None] * 6
                             for idx in range(6):
                                 raw_val = raw_norm_vals[idx]
                                 left_raw = joint_left_raw[idx]
                                 right_raw = joint_right_raw[idx]
                                 center_raw = joint_center_raw[idx]
-                                if raw_val <= left_raw:
-                                    deg = joint_left_deg[idx]
-                                elif raw_val >= right_raw:
-                                    deg = joint_right_deg[idx]
-                                elif raw_val < center_raw:
-                                    span = center_raw - left_raw
-                                    deg = 0.0 if span <= 0 else (raw_val - center_raw) * (abs(joint_left_deg[idx]) / span)
-                                else:
-                                    span = right_raw - center_raw
-                                    deg = 0.0 if span <= 0 else (raw_val - center_raw) * (abs(joint_right_deg[idx]) / span)
+                                deg = _map_raw_to_deg(
+                                    raw_val,
+                                    left_raw,
+                                    center_raw,
+                                    right_raw,
+                                    joint_left_deg[idx],
+                                    joint_right_deg[idx],
+                                )
                                 action[idx] = lerobot_sim_zero[idx] + math.radians(deg)
+                                debug_degs[idx] = deg
                                 if idx == 0:
                                     pan_deg = deg
+                            if args_cli.lerobot_mapping_debug:
+                                debug_msg = ", ".join(
+                                    f"{name} raw={raw_norm_vals[i]:7.2f} deg={debug_degs[i]:7.2f} rad={action[i]:7.3f}"
+                                    for i, name in enumerate(lerobot_joint_names)
+                                )
+                                print(f"[LEROBOT MAP] {debug_msg}")
                         else:
                             # Shoulder pan: asymmetric mapping using measured raw limits.
                             raw_pan = raw_norm_vals[0]
