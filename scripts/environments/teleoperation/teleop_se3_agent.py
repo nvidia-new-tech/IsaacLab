@@ -409,6 +409,17 @@ def main() -> None:
         simulation_app.close()
         return
 
+    keyboard_reset_interface = None
+    if args_cli.teleop_device.lower() != "keyboard":
+        try:
+            keyboard_reset_interface = Se3Keyboard(Se3KeyboardCfg(pos_sensitivity=0.0, rot_sensitivity=0.0))
+            for key, callback in teleoperation_callbacks.items():
+                keyboard_reset_interface.add_callback(key, callback)
+            keyboard_reset_interface.reset()
+        except Exception as e:
+            logger.warning(f"Failed to enable global keyboard reset: {e}")
+            keyboard_reset_interface = None
+
     print(f"Using teleop device: {teleop_interface}")
 
     # reset environment
