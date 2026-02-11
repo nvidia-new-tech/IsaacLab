@@ -28,19 +28,23 @@ class Soarm101CubeStackLeRobotEnvCfg(stack_joint_pos_env_cfg.Soram101CubeStackEn
         # Disable URDF joint drives to rely on actuator PD control.
         self.scene.robot.spawn.joint_drive = None
         # Explicit PD gains (Kp/Kd) for joint-position control.
+        self.scene.robot.actuators["arm"].effort_limit_sim = 30.0
+        self.scene.robot.actuators["arm"].velocity_limit_sim = 6.0
         self.scene.robot.actuators["arm"].stiffness = {
-            "shoulder_pan": 400.0,
-            "shoulder_lift": 600.0,
-            "elbow_flex": 400.0,
-            "wrist_flex": 200.0,
-            "wrist_roll": 100.0,
+            "shoulder_pan": 800.0,
+            "shoulder_lift": 900.0,
+            "elbow_flex": 700.0,
+            "wrist_flex": 500.0,
+            "wrist_roll": 300.0,
         }
         self.scene.robot.actuators["arm"].damping = {
-            "shoulder_pan": 10.0,
-            "shoulder_lift": 15.0,
-            "elbow_flex": 10.0,
-            "wrist_flex": 5.0,
-            "wrist_roll": 2.0,
+            "shoulder_pan": 60.0,
+            "shoulder_lift": 70.0,
+            "elbow_flex": 55.0,
+            "wrist_flex": 45.0,
+            "wrist_roll": 35.0,
         }
-        self.scene.robot.actuators["gripper"].stiffness = 60.0
-        self.scene.robot.actuators["gripper"].damping = 20.0
+        self.scene.robot.actuators["gripper"].effort_limit_sim = 8.0
+        self.scene.robot.actuators["gripper"].velocity_limit_sim = 1.0
+        self.scene.robot.actuators["gripper"].stiffness = 800.0
+        self.scene.robot.actuators["gripper"].damping = 80.0
