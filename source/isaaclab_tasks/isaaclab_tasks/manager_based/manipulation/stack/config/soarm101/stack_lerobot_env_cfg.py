@@ -27,6 +27,10 @@ class Soarm101CubeStackLeRobotEnvCfg(stack_joint_pos_env_cfg.Soram101CubeStackEn
 
         # Disable URDF joint drives to rely on actuator PD control.
         self.scene.robot.spawn.joint_drive = None
+        # Increase contact friction for more reliable grasping.
+        self.sim.physics_material.static_friction = 2.0
+        self.sim.physics_material.dynamic_friction = 1.5
+        self.sim.physics_material.friction_combine_mode = "multiply"
         # Explicit PD gains (Kp/Kd) for joint-position control.
         self.scene.robot.actuators["arm"].effort_limit_sim = 30.0
         self.scene.robot.actuators["arm"].velocity_limit_sim = 6.0
@@ -44,7 +48,7 @@ class Soarm101CubeStackLeRobotEnvCfg(stack_joint_pos_env_cfg.Soram101CubeStackEn
             "wrist_flex": 45.0,
             "wrist_roll": 35.0,
         }
-        self.scene.robot.actuators["gripper"].effort_limit_sim = 8.0
+        self.scene.robot.actuators["gripper"].effort_limit_sim = 400.0
         self.scene.robot.actuators["gripper"].velocity_limit_sim = 1.0
-        self.scene.robot.actuators["gripper"].stiffness = 800.0
-        self.scene.robot.actuators["gripper"].damping = 80.0
+        self.scene.robot.actuators["gripper"].stiffness = 32000.0
+        self.scene.robot.actuators["gripper"].damping = 1200.0
