@@ -27,6 +27,7 @@ optional arguments:
 # Standard library imports
 import argparse
 import contextlib
+import math
 
 # Isaac Lab AppLauncher
 from isaaclab.app import AppLauncher
@@ -41,8 +42,87 @@ parser.add_argument(
     help=(
         "Teleop device. Set here (legacy) or via the environment config. If using the environment config, pass the"
         " device key/name defined under 'teleop_devices' (it can be a custom name, not necessarily 'handtracking')."
-        " Built-ins: keyboard, spacemouse, gamepad. Not all tasks support all built-ins."
+        " Built-ins: keyboard, spacemouse, lerobot. Not all tasks support all built-ins."
     ),
+)
+parser.add_argument("--port", type=str, default=None, help="Serial port for LeRobot (e.g. /dev/ttyACM0).")
+parser.add_argument(
+    "--lerobot_calibrate",
+    action="store_true",
+    default=True,
+    help="Run LeRobot calibration if no calibration is found.",
+)
+parser.add_argument(
+    "--lerobot_calibrate_at_start",
+    action="store_true",
+    default=True,
+    help="Calibrate initial pose offset between leader and sim on start.",
+)
+parser.add_argument(
+    "--lerobot_arm_gain",
+    type=float,
+    default=1.0,
+    help="Scale factor for leader arm joint deltas before applying to the sim.",
+)
+parser.add_argument(
+    "--lerobot_gripper_gain",
+    type=float,
+    default=1.0,
+    help="Scale factor for leader gripper delta before applying to the sim.",
+)
+parser.add_argument(
+    "--lerobot_mapping_calibrate",
+    action="store_true",
+    default=False,
+    help="Print raw lerobot joint values for calibration.",
+)
+parser.add_argument(
+    "--lerobot_mapping_debug",
+    action="store_true",
+    default=False,
+    help="Print lerobot raw-to-action mapping per joint.",
+)
+parser.add_argument(
+    "--lerobot_joint_center_raw",
+    type=str,
+    default="5.66,0.67,3.21,1.03,1.04,7.11",
+    help="Comma-separated center raw values for joints: shoulder_pan, shoulder_lift, elbow_flex, wrist_flex, wrist_roll, gripper.",
+)
+parser.add_argument(
+    "--lerobot_joint_left_raw",
+    type=str,
+    default="-100.00,-99.75,-99.55,-98.54,92.82,0.00",
+    help="Comma-separated left/raw-min values for joints (same order as center).",
+)
+parser.add_argument(
+    "--lerobot_joint_right_raw",
+    type=str,
+    default="100.00,99.92,99.19,73.68,-92.38,100.00",
+    help="Comma-separated right/raw-max values for joints (same order as center).",
+)
+parser.add_argument(
+    "--lerobot_joint_left_deg",
+    type=str,
+    default="-110,-100,-100,95,-170,-10",
+    help="Comma-separated left/deg-min values for joints (same order as center).",
+)
+parser.add_argument(
+    "--lerobot_joint_right_deg",
+    type=str,
+    default="110,100,90,-95,170,100",
+    help="Comma-separated right/deg-max values for joints (same order as center).",
+)
+parser.add_argument(
+    "--lerobot_id",
+    type=str,
+    default=None,
+    help="LeRobot robot id for calibration lookup (e.g. soarm101).",
+)
+parser.add_argument(
+    "--lerobot_calibration_dir",
+    type=str,
+    default=None,
+    help="Optional LeRobot calibration directory override.",
 )
 parser.add_argument(
     "--dataset_file", type=str, default="./datasets/dataset.hdf5", help="File path to export recorded demos."
@@ -100,7 +180,7 @@ import torch
 
 import omni.ui as ui
 
-from isaaclab.devices import Se3Keyboard, Se3KeyboardCfg, Se3SpaceMouse, Se3SpaceMouseCfg
+from isaaclab.devices import LeRobotDevice, Se3Keyboard, Se3KeyboardCfg, Se3SpaceMouse, Se3SpaceMouseCfg
 from isaaclab.devices.openxr import remove_camera_configs
 from isaaclab.devices.teleop_device_factory import create_teleop_device
 
@@ -119,10 +199,119 @@ from isaaclab.envs.ui import EmptyWindow
 from isaaclab.managers import DatasetExportMode
 
 import isaaclab_tasks  # noqa: F401
+from isaaclab_tasks.manager_based.manipulation.stack import mdp as stack_mdp
 from isaaclab_tasks.utils.parse_cfg import parse_env_cfg
 
 # import logger
 logger = logging.getLogger(__name__)
+
+
+def _parse_csv_floats(value: str | None, expected: int, name: str) -> list[float] | None:
+    if value is None:
+        return None
+    parts = [p.strip() for p in value.split(",") if p.strip()]
+    if len(parts) != expected:
+        raise ValueError(f"{name} expects {expected} comma-separated values, got {len(parts)}: {value}")
+    return [float(p) for p in parts]
+
+
+def _map_raw_to_deg(raw: float, left_raw: float, center_raw: float, right_raw: float, left_deg: float, right_deg: float) -> float:
+    if left_raw < right_raw:
+        if raw <= left_raw:
+            return left_deg
+        if raw >= right_raw:
+            return right_deg
+        if raw < center_raw:
+            span = center_raw - left_raw
+            return 0.0 if span <= 0 else (raw - center_raw) * (abs(left_deg) / span)
+        span = right_raw - center_raw
+        return 0.0 if span <= 0 else (raw - center_raw) * (abs(right_deg) / span)
+    if raw >= left_raw:
+        return left_deg
+    if raw <= right_raw:
+        return right_deg
+    if raw > center_raw:
+        span = left_raw - center_raw
+        return 0.0 if span <= 0 else (raw - center_raw) * (abs(left_deg) / span)
+    span = center_raw - right_raw
+    return 0.0 if span <= 0 else (raw - center_raw) * (abs(right_deg) / span)
+
+
+def _get_stack_success_params(env, success_term: object | None) -> tuple[float, float, float, float | None]:
+    xy_threshold = 0.04
+    height_threshold = 0.005
+    height_diff = 0.0468
+    gripper_open_min = None
+    params = None
+    if success_term is not None:
+        params = getattr(success_term, "params", None)
+    if params is None and hasattr(env.cfg, "terminations"):
+        params = getattr(env.cfg.terminations, "success", None)
+        params = getattr(params, "params", None) if params is not None else None
+    if isinstance(params, dict):
+        xy_threshold = params.get("xy_threshold", xy_threshold)
+        height_threshold = params.get("height_threshold", height_threshold)
+        height_diff = params.get("height_diff", height_diff)
+        gripper_open_min = params.get("gripper_open_min", gripper_open_min)
+    return xy_threshold, height_threshold, height_diff, gripper_open_min
+
+
+def _stack_success_conditions(env, success_term: object | None) -> tuple[bool, bool, bool, torch.Tensor | None, float | None]:
+    robot = env.scene["robot"]
+    cube_1 = env.scene["cube_1"]
+    cube_2 = env.scene["cube_2"]
+    cube_3 = env.scene["cube_3"]
+
+    xy_threshold, height_threshold, height_diff, gripper_open_min = _get_stack_success_params(env, success_term)
+    pos_diff_c12 = cube_1.data.root_pos_w - cube_2.data.root_pos_w
+    pos_diff_c23 = cube_2.data.root_pos_w - cube_3.data.root_pos_w
+
+    xy_dist_c12 = torch.norm(pos_diff_c12[:, :2], dim=1)
+    xy_dist_c23 = torch.norm(pos_diff_c23[:, :2], dim=1)
+    xy_ok = torch.logical_and(xy_dist_c12 < xy_threshold, xy_dist_c23 < xy_threshold)
+
+    h_dist_c12 = torch.norm(pos_diff_c12[:, 2:], dim=1)
+    h_dist_c23 = torch.norm(pos_diff_c23[:, 2:], dim=1)
+    height_ok = torch.logical_and(h_dist_c12 - height_diff < height_threshold, pos_diff_c12[:, 2] < 0.0)
+    height_ok = torch.logical_and(height_ok, h_dist_c23 - height_diff < height_threshold)
+    height_ok = torch.logical_and(height_ok, pos_diff_c23[:, 2] < 0.0)
+
+    gripper_ok = torch.ones_like(xy_ok)
+    if hasattr(env.scene, "surface_grippers") and len(env.scene.surface_grippers) > 0:
+        surface_gripper = env.scene.surface_grippers["surface_gripper"]
+        suction_cup_status = surface_gripper.state.view(-1, 1)
+        gripper_ok = (suction_cup_status == -1).to(torch.float32).squeeze(1)
+    elif hasattr(env.cfg, "gripper_joint_names"):
+        gripper_joint_ids, _ = robot.find_joints(env.cfg.gripper_joint_names)
+        target = torch.tensor(env.cfg.gripper_open_val, dtype=torch.float32, device=env.device)
+        if len(gripper_joint_ids) == 1:
+            if gripper_open_min is not None:
+                gripper_ok = robot.data.joint_pos[:, gripper_joint_ids[0]] >= gripper_open_min
+            else:
+                gripper_ok = torch.isclose(
+                    robot.data.joint_pos[:, gripper_joint_ids[0]], target, atol=0.0001, rtol=0.0001
+                )
+        elif len(gripper_joint_ids) >= 2:
+            gripper_ok = torch.logical_and(
+                torch.isclose(robot.data.joint_pos[:, gripper_joint_ids[0]], target, atol=0.0001, rtol=0.0001),
+                torch.isclose(robot.data.joint_pos[:, gripper_joint_ids[1]], target, atol=0.0001, rtol=0.0001),
+            )
+        else:
+            gripper_ok = torch.zeros_like(xy_ok)
+
+    gripper_pos = None
+    if hasattr(env.cfg, "gripper_joint_names"):
+        gripper_joint_ids, _ = robot.find_joints(env.cfg.gripper_joint_names)
+        if len(gripper_joint_ids) >= 1:
+            gripper_pos = robot.data.joint_pos[:, gripper_joint_ids[0]].clone()
+
+    return (
+        bool(xy_ok.any().item()),
+        bool(height_ok.any().item()),
+        bool(gripper_ok.any().item()),
+        gripper_pos,
+        gripper_open_min,
+    )
 
 
 class RateLimiter:
@@ -289,14 +478,27 @@ def setup_teleop_device(callbacks: dict[str, Callable]) -> object:
                 teleop_interface = Se3Keyboard(Se3KeyboardCfg(pos_sensitivity=0.2, rot_sensitivity=0.5))
             elif args_cli.teleop_device.lower() == "spacemouse":
                 teleop_interface = Se3SpaceMouse(Se3SpaceMouseCfg(pos_sensitivity=0.2, rot_sensitivity=0.5))
+            elif args_cli.teleop_device.lower() == "lerobot":
+                if not args_cli.port:
+                    logger.error("LeRobot teleop requires --port to be specified (e.g. /dev/ttyACM0)")
+                    exit(1)
+                teleop_interface = LeRobotDevice(
+                    port=args_cli.port,
+                    calibrate=args_cli.lerobot_calibrate,
+                    robot_id=args_cli.lerobot_id,
+                    calibration_dir=args_cli.lerobot_calibration_dir,
+                )
             else:
                 logger.error(f"Unsupported teleop device: {args_cli.teleop_device}")
-                logger.error("Supported devices: keyboard, spacemouse, handtracking")
+                logger.error("Supported devices: keyboard, spacemouse, handtracking, lerobot")
                 exit(1)
 
             # Add callbacks to fallback device
             for key, callback in callbacks.items():
-                teleop_interface.add_callback(key, callback)
+                try:
+                    teleop_interface.add_callback(key, callback)
+                except (ValueError, TypeError) as e:
+                    logger.warning(f"Failed to add callback for key {key}: {e}")
     except Exception as e:
         logger.error(f"Failed to create teleop device: {e}")
         exit(1)
@@ -444,7 +646,29 @@ def run_simulation_loop(
     }
 
     teleop_interface = setup_teleop_device(teleoperation_callbacks)
-    teleop_interface.add_callback("R", reset_recording_instance)
+    try:
+        teleop_interface.add_callback("R", reset_recording_instance)
+    except (ValueError, TypeError) as e:
+        logger.warning(f"Failed to add callback for key R: {e}")
+
+    lerobot_joint_ids = None
+    lerobot_joint_limits = None
+    lerobot_leader_zero = None
+    lerobot_sim_zero = None
+    lerobot_calibrate_pending = args_cli.lerobot_calibrate_at_start
+    lerobot_joint_names = [
+        "shoulder_pan",
+        "shoulder_lift",
+        "elbow_flex",
+        "wrist_flex",
+        "wrist_roll",
+        "gripper",
+    ]
+    joint_center_raw = _parse_csv_floats(args_cli.lerobot_joint_center_raw, 6, "--lerobot_joint_center_raw")
+    joint_left_raw = _parse_csv_floats(args_cli.lerobot_joint_left_raw, 6, "--lerobot_joint_left_raw")
+    joint_right_raw = _parse_csv_floats(args_cli.lerobot_joint_right_raw, 6, "--lerobot_joint_right_raw")
+    joint_left_deg = _parse_csv_floats(args_cli.lerobot_joint_left_deg, 6, "--lerobot_joint_left_deg")
+    joint_right_deg = _parse_csv_floats(args_cli.lerobot_joint_right_deg, 6, "--lerobot_joint_right_deg")
 
     # Reset before starting
     env.sim.reset()
@@ -456,10 +680,76 @@ def run_simulation_loop(
 
     subtasks = {}
 
+    last_success_log_time = 0.0
     with contextlib.suppress(KeyboardInterrupt) and torch.inference_mode():
         while simulation_app.is_running():
-            # Get keyboard command
             action = teleop_interface.advance()
+            is_lerobot_action = isinstance(action, dict) and "joint_pos" in action and "gripper" in action
+            if is_lerobot_action:
+                if args_cli.lerobot_mapping_calibrate:
+                    raw_list = list(action["joint_pos"]) + [action["gripper"]]
+                    raw_msg = ", ".join(f"{name}={val:7.2f}" for name, val in zip(lerobot_joint_names, raw_list))
+                    print(f"[LEROBOT RAW] {raw_msg}")
+
+                if lerobot_joint_ids is None:
+                    robot = env.scene["robot"]
+                    lerobot_joint_ids, _ = robot.find_joints(lerobot_joint_names)
+                    lerobot_joint_limits = robot.data.soft_joint_pos_limits[0, lerobot_joint_ids].clone()
+
+                arm_vals = torch.tensor(list(action["joint_pos"]), dtype=torch.float32, device=env.device)
+                grip_val = torch.tensor([action["gripper"]], dtype=torch.float32, device=env.device)
+                raw_vals = torch.cat([arm_vals, grip_val], dim=0)
+                raw_norm_vals = raw_vals.clone()
+
+                mins = lerobot_joint_limits[:, 0]
+                maxs = lerobot_joint_limits[:, 1]
+                in_range = torch.logical_and(raw_vals >= (mins - 0.1), raw_vals <= (maxs + 0.1)).all()
+                if not in_range:
+                    arm_norm = raw_vals[:-1].clamp(-100.0, 100.0)
+                    grip_norm = raw_vals[-1].clamp(0.0, 100.0)
+                    arm_scaled = mins[:-1] + (arm_norm + 100.0) * (maxs[:-1] - mins[:-1]) / 200.0
+                    grip_scaled = mins[-1] + (grip_norm) * (maxs[-1] - mins[-1]) / 100.0
+                    raw_vals = torch.cat([arm_scaled, grip_scaled.unsqueeze(0)], dim=0)
+
+                if lerobot_calibrate_pending or lerobot_leader_zero is None or lerobot_sim_zero is None:
+                    lerobot_leader_zero = raw_vals.clone()
+                    lerobot_sim_zero = env.scene["robot"].data.joint_pos[0, lerobot_joint_ids].clone()
+                    lerobot_calibrate_pending = False
+
+                gains = torch.tensor(
+                    [args_cli.lerobot_arm_gain] * 5 + [args_cli.lerobot_gripper_gain],
+                    dtype=torch.float32,
+                    device=env.device,
+                )
+                action = lerobot_sim_zero + (raw_vals - lerobot_leader_zero) * gains
+
+                # Per-joint asymmetric mapping using measured raw limits (optional).
+                if all(
+                    v is not None
+                    for v in (joint_center_raw, joint_left_raw, joint_right_raw, joint_left_deg, joint_right_deg)
+                ):
+                    debug_degs = [None] * 6
+                    for idx in range(6):
+                        deg = _map_raw_to_deg(
+                            raw_norm_vals[idx],
+                            joint_left_raw[idx],
+                            joint_center_raw[idx],
+                            joint_right_raw[idx],
+                            joint_left_deg[idx],
+                            joint_right_deg[idx],
+                        )
+                        action[idx] = lerobot_sim_zero[idx] + math.radians(deg)
+                        debug_degs[idx] = deg
+                    if args_cli.lerobot_mapping_debug:
+                        debug_msg = ", ".join(
+                            f"{name} raw={raw_norm_vals[i]:7.2f} deg={debug_degs[i]:7.2f} rad={action[i]:7.3f}"
+                            for i, name in enumerate(lerobot_joint_names)
+                        )
+                        print(f"[LEROBOT MAP] {debug_msg}")
+
+                action = action.clamp(mins, maxs)
+            elif not torch.is_tensor(action):
+                action = torch.tensor(action, dtype=torch.float32, device=env.device)
             # Expand to batch dimension
             actions = action.repeat(env.num_envs, 1)
 
@@ -474,6 +764,32 @@ def run_simulation_loop(
                         show_subtask_instructions(instruction_display, subtasks, obv, env.cfg)
             else:
                 env.sim.render()
+
+            if "Stack" in args_cli.task:
+                now = time.time()
+                if now - last_success_log_time >= 5.0:
+                    last_success_log_time = now
+                    success = stack_mdp.cubes_stacked(env)
+                    success_any = bool(success.any().item())
+                    print(
+                        f"[SUCCESS] cubes_stacked={success_any} "
+                        f"(count={int(success.sum().item())}/{env.num_envs})"
+                    )
+                    xy_ok, height_ok, gripper_ok, gripper_pos, gripper_open_min = _stack_success_conditions(
+                        env, success_term
+                    )
+                    print(f"[SUCCESS] xy_aligned={xy_ok}")
+                    print(f"[SUCCESS] height_aligned={height_ok}")
+                    print(f"[SUCCESS] gripper_open={gripper_ok}")
+                    if gripper_pos is not None:
+                        mean_pos = float(gripper_pos.mean().item())
+                        min_pos = float(gripper_pos.min().item())
+                        max_pos = float(gripper_pos.max().item())
+                        print(
+                            f"[SUCCESS] gripper_pos_mean={mean_pos:.4f} "
+                            f"min={min_pos:.4f} max={max_pos:.4f} "
+                            f"open_min={gripper_open_min}"
+                        )
 
             # Check for success condition
             success_step_count, success_reset_needed = process_success_condition(env, success_term, success_step_count)

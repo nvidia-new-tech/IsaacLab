@@ -3,6 +3,7 @@
 #
 # SPDX-License-Identifier: BSD-3-Clause
 
+from isaaclab.managers import TerminationTermCfg as DoneTerm
 from isaaclab.utils import configclass
 
 from isaaclab_tasks.manager_based.manipulation.stack import mdp
@@ -52,3 +53,13 @@ class Soarm101CubeStackLeRobotEnvCfg(stack_joint_pos_env_cfg.Soram101CubeStackEn
         self.scene.robot.actuators["gripper"].velocity_limit_sim = 1.0
         self.scene.robot.actuators["gripper"].stiffness = 32000.0
         self.scene.robot.actuators["gripper"].damping = 1200.0
+
+        # Adjust success condition thresholds for scaled-down cubes.
+        self.terminations.success = DoneTerm(
+            func=mdp.cubes_stacked_gripper_threshold,
+            params={
+                "xy_threshold": 0.02,
+                "height_diff": 0.0234,
+                "gripper_open_min": 0.4,
+            },
+        )

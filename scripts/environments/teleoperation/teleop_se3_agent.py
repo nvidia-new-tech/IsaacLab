@@ -185,6 +185,7 @@ from isaaclab.managers import TerminationTermCfg as DoneTerm
 
 import isaaclab_tasks  # noqa: F401
 from isaaclab_tasks.manager_based.manipulation.lift import mdp
+from isaaclab_tasks.manager_based.manipulation.stack import mdp as stack_mdp
 from isaaclab_tasks.utils import parse_env_cfg
 
 if args_cli.enable_pinocchio:
@@ -429,6 +430,7 @@ def main() -> None:
     print("Teleoperation started. Press 'R' to reset the environment.")
 
     # simulate environment
+    success_prev = None
     while simulation_app.is_running():
         try:
             # run everything in inference mode
@@ -557,6 +559,16 @@ def main() -> None:
                     env.step(actions)
                 else:
                     env.sim.render()
+
+                if "Stack" in args_cli.task:
+                    success = stack_mdp.cubes_stacked(env)
+                    success_any = bool(success.any().item())
+                    if success_prev is None or success_any != success_prev:
+                        success_prev = success_any
+                        print(
+                            f"[SUCCESS] cubes_stacked={success_any} "
+                            f"(count={int(success.sum().item())}/{env.num_envs})"
+                        )
 
                 if should_reset_recording_instance:
                     env.reset()
